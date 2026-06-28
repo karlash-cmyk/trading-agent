@@ -8,6 +8,8 @@ import os
 import re
 import atexit
 import threading
+import urllib.request
+import urllib.parse
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
@@ -78,9 +80,56 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_KEY")
 BYBIT_KEY = os.getenv("BYBIT_KEY")
 BYBIT_SECRET = os.getenv("BYBIT_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not all([BINANCE_KEY, BINANCE_SECRET, ANTHROPIC_KEY]):
     raise EnvironmentError("Missing required environment variables. Check your .env file.")
+
+# --- Telegram notifications (NOTIFY-ONLY: never affects trading) ------------
+# Messages are built from EXISTING memory data via string templates -- NO LLM
+# calls, zero token cost. If TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing,
+# notifications are silently disabled (no crash). Every send is wrapped in
+# try/except routed through log_runtime_error, so a failed notification can
+# NEVER affect trading or crash the loop.
+NOTIFY_TRADES = True       # alert on each paper trade opened / closed
+NOTIFY_DRAWDOWN = True     # alert on risk-mode TRANSITIONS only (not per rotation)
+NOTIFY_HEALTH = True       # alert on health-check failures (deduplicated)
+NOTIFY_DIGEST = True       # weekly template digest
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+DIGEST_INTERVAL_SECONDS = 7 * 24 * 3600
+WIN_RATE_BASELINE = 43.5   # validated 6-month crypto backtest baseline (digest)
+
+# ===========================================================================
+# KILL-SWITCH / SAFETY CIRCUIT BREAKER  (configurable; default ON)
+# ===========================================================================
+# This layer ONLY stops opening NEW trades and raises alerts. It NEVER changes
+# signal rules, position sizing, or stop/target levels -- it is a gate in front
+# of new entries, not a change to how entries are computed.
+#
+# It is deliberately SEPARATE from the drawdown PROTECTION above. Ordinary
+# losing is NOT an emergency: a ~42% win-rate system has long losing runs as a
+# matter of course, and the drawdown logic (REDUCED at 6%, PAUSED at 12%, with
+# auto-resume) already handles "we are losing". The kill switch fires only when
+# something is GENUINELY BROKEN and must NOT auto-resume:
+#   1. a capital emergency far beyond the pause level (hard equity floor),
+#   2. the health check failing repeatedly (a persistent broken state), or
+#   3. an impossible/anomalous state (inverted stops, cap breach, a loss bigger
+#      than the risk model permits).
+# None of these can be produced by a normal losing streak -- see notes below.
+# Once tripped the system stays killed until clear_kill_switch() is called
+# DELIBERATELY; it never auto-resumes.
+KILL_SWITCH_ENABLED = True
+# 1. HARD EQUITY FLOOR -- kill if validated drawdown exceeds this. Set well
+#    past DD_PAUSE_PCT (12%) so a normal losing run can never reach it.
+KILL_HARD_DRAWDOWN_PCT = 20.0
+# 2. REPEATED HEALTH FAILURES -- kill if run_health_check fails this many
+#    rotations IN A ROW (a broken feed/state, not a losing streak).
+KILL_HEALTH_CONSECUTIVE = 3
+# 3. ANOMALY -- a closed loss larger than this multiple of its OWN recorded
+#    risk means the stop logic failed. Paper exits are normally exact (loss ==
+#    risk), so this multiple has wide headroom and cannot trip on variance.
+KILL_LOSS_RISK_MULTIPLE = 1.5
 
 ACCOUNT_SIZE = 1000
 MAX_RISK_PERCENT = 1
@@ -337,6 +386,311 @@ def bump_stat(key, n=1):
         save_memory(mem)
     except Exception as e:
         print(f"  !! ERROR [bump_stat {key}] -> {e}")
+
+# ===========================================================================
+# TELEGRAM NOTIFICATIONS  (NOTIFY-ONLY LAYER)
+# ===========================================================================
+# This whole section is observability only. It reads EXISTING memory data and
+# formats it with plain string templates -- there are NO LLM calls here, so it
+# costs zero tokens. It NEVER changes signal rules, sizing, stops/targets, the
+# drawdown logic, or the health check. Every network send is wrapped so a
+# Telegram outage just logs an error and trading continues untouched.
+# ---------------------------------------------------------------------------
+
+def telegram_send(text):
+    """Fire-and-forget Telegram message via a plain HTTPS POST (stdlib urllib,
+    no heavy deps). Silently disabled when token/chat id are absent. Any error
+    is logged through log_runtime_error and swallowed -- a failed notification
+    can never crash the loop or touch trading state. Returns True on success."""
+    if not TELEGRAM_ENABLED:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception as e:
+        log_runtime_error("telegram", e)
+        return False
+
+def send_test_telegram():
+    """One-off connectivity test -- call this manually to confirm TELEGRAM_TOKEN
+    and TELEGRAM_CHAT_ID work end to end. Does not touch trading state."""
+    if not TELEGRAM_ENABLED:
+        print("Telegram: DISABLED -- set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID in .env.")
+        return False
+    ok = telegram_send("✅ Day-trade bot: Telegram test message. "
+                       "Token + chat ID are working.")
+    print("Telegram: test message sent OK." if ok
+          else "Telegram: test FAILED (see error above).")
+    return ok
+
+def notify_trade_opened(pos):
+    """Alert 1: a paper position was opened. Built from the position dict."""
+    if not (NOTIFY_TRADES and TELEGRAM_ENABLED):
+        return
+    wtag = " [WATCH]" if pos.get("watch") else ""
+    side = "\U0001f7e2 LONG" if pos.get("direction") == "BUY" else "\U0001f534 SHORT"
+    telegram_send(
+        f"\U0001f4c8 TRADE OPENED{wtag}\n"
+        f"{side} {pos.get('pair')}\n"
+        f"Regime : {pos.get('regime')}\n"
+        f"Entry  : {pos.get('entry')}\n"
+        f"Stop   : {pos.get('stop')} | Target: {pos.get('target')}\n"
+        f"Risk   : ${pos.get('risk_usdt', 0):.2f} ({pos.get('risk_percent')}%)"
+    )
+
+def notify_trade_closed(closed, win_rate, closed_count):
+    """Alert 2: a paper position closed. win_rate/closed_count are the running
+    figures for the relevant book (validated or watch) passed in by the caller."""
+    if not (NOTIFY_TRADES and TELEGRAM_ENABLED):
+        return
+    wtag = " [WATCH]" if closed.get("watch") else ""
+    result = "✅ WIN" if closed.get("outcome") == "WIN" else "❌ LOSS"
+    telegram_send(
+        f"\U0001f4c9 TRADE CLOSED{wtag}\n"
+        f"{closed.get('direction')} {closed.get('pair')} -> {result}\n"
+        f"PnL      : ${closed.get('pnl_usdt', 0):+.2f}\n"
+        f"Win rate : {win_rate}% ({closed_count} closed)"
+    )
+
+def notify_drawdown_transition(old_mode, new_mode, rs):
+    """Alert 3: risk-mode TRANSITION only (caller guarantees old != new)."""
+    if not (NOTIFY_DRAWDOWN and TELEGRAM_ENABLED):
+        return
+    telegram_send(
+        f"⚠️ RISK MODE: {old_mode} -> {new_mode}\n"
+        f"Equity   : ${rs.get('equity', 0):.2f} | Peak: ${rs.get('peak_equity', 0):.2f}\n"
+        f"Drawdown : {rs.get('drawdown_pct', 0)}%"
+    )
+
+def notify_health(fails):
+    """Alert 4: health-check failures (dedup is handled by the caller)."""
+    if not (NOTIFY_HEALTH and TELEGRAM_ENABLED):
+        return
+    body = "\n".join(f"- {f}" for f in fails[:10])
+    extra = f"\n(+{len(fails) - 10} more)" if len(fails) > 10 else ""
+    telegram_send(f"\U0001f6a8 HEALTH WARNING ({len(fails)})\n{body}{extra}")
+
+def _digest_ts(s):
+    """Parse a 'YYYY-mm-dd HH:MM:SS' local timestamp to unix seconds (0 on fail)."""
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return 0.0
+
+def build_weekly_digest(mem, since):
+    """Template-based weekly summary string. Reads ONLY existing memory fields;
+    no LLM, no token cost. `since` is the unix ts of the previous digest."""
+    closed_all = mem.get("paper_closed", [])
+    # This week's VALIDATED closes (watch excluded), by close_time.
+    week = [t for t in closed_all
+            if not t.get("watch") and _digest_ts(t.get("close_time", "")) >= since]
+    ww = sum(1 for t in week if t.get("outcome") == "WIN")
+    wl = sum(1 for t in week if t.get("outcome") == "LOSS")
+    wpnl = round(sum(t.get("pnl_usdt", 0.0) for t in week), 2)
+
+    ps = mem.get("paper_stats", {})
+    cw, cl = ps.get("wins", 0), ps.get("losses", 0)
+    closed_total = cw + cl
+    live_wr = round(cw / closed_total * 100, 1) if closed_total else 0.0
+    delta = round(live_wr - WIN_RATE_BASELINE, 1)
+
+    by_pair = mem.get("paper_breakdown", {}).get("by_pair", {})
+    ranked = sorted(by_pair.items(), key=lambda kv: kv[1].get("pnl", 0.0))
+    worst = ranked[0] if ranked else None
+    best = ranked[-1] if ranked else None
+
+    rs = mem.get("risk_state", {})
+    xlm = by_pair.get("XLMUSDT")
+    wps = mem.get("watch_stats", {})
+    w_closed = wps.get("wins", 0) + wps.get("losses", 0)
+
+    lines = [
+        "\U0001f4ca WEEKLY DIGEST (template, no LLM)",
+        f"This week: {len(week)} closed | {ww}W / {wl}L | PnL ${wpnl:+.2f}",
+        f"Live win rate: {live_wr}% ({closed_total} closed) "
+        f"vs {WIN_RATE_BASELINE}% baseline ({delta:+.1f} pts)",
+    ]
+    if best:
+        lines.append(f"Best pair : {best[0]} ${best[1].get('pnl', 0.0):+.2f} "
+                     f"({best[1].get('wins', 0)}W/{best[1].get('losses', 0)}L)")
+    if worst and worst is not best:
+        lines.append(f"Worst pair: {worst[0]} ${worst[1].get('pnl', 0.0):+.2f} "
+                     f"({worst[1].get('wins', 0)}W/{worst[1].get('losses', 0)}L)")
+    lines.append(f"Equity: ${rs.get('equity', 0):.2f} | "
+                 f"Drawdown: {rs.get('drawdown_pct', 0)}% | mode {rs.get('mode', 'NORMAL')}")
+    # Research status: promotions/demotions are MANUAL config changes -- report
+    # the current universe so any change is visible week to week.
+    lines.append(f"Universe: validated {CRYPTO_PAIRS} | watch {WATCH_PAIRS} "
+                 f"(promotions are manual)")
+    if w_closed:
+        w_wr = round(wps.get("wins", 0) / w_closed * 100, 1)
+        lines.append(f"Watch record: {w_wr}% ({w_closed} closed) "
+                     f"PnL ${wps.get('total_pnl', 0.0):+.2f}")
+    if xlm:
+        x_closed = xlm.get("wins", 0) + xlm.get("losses", 0)
+        x_wr = round(xlm.get("wins", 0) / x_closed * 100, 1) if x_closed else 0.0
+        lines.append(f"XLM (paper-trial): {x_wr}% ({xlm.get('wins', 0)}W/"
+                     f"{xlm.get('losses', 0)}L) PnL ${xlm.get('pnl', 0.0):+.2f}")
+    else:
+        lines.append("XLM (paper-trial): no closed trades yet")
+    return "\n".join(lines)
+
+def maybe_send_weekly_digest():
+    """Send the weekly digest if >= 7 days since the last one. Tracks
+    notify.digest_last_sent in memory. On first run it just arms the timer
+    (first digest goes out ~7 days later). Notify-only."""
+    if not (NOTIFY_DIGEST and TELEGRAM_ENABLED):
+        return
+    try:
+        mem = load_memory()
+        notify = mem.setdefault("notify", {})
+        now = time.time()
+        last = notify.get("digest_last_sent")
+        if last is None:
+            notify["digest_last_sent"] = now      # arm; no immediate send
+            save_memory(mem)
+            return
+        if now - last < DIGEST_INTERVAL_SECONDS:
+            return
+        if telegram_send(build_weekly_digest(mem, since=last)):
+            notify["digest_last_sent"] = now      # advance only on success
+            save_memory(mem)
+    except Exception as e:
+        log_runtime_error("weekly-digest", e)
+
+# ===========================================================================
+# KILL-SWITCH / SAFETY CIRCUIT BREAKER  (implementation)
+# ===========================================================================
+# Read the trigger constants at the top of the file (KILL_SWITCH_ENABLED,
+# KILL_HARD_DRAWDOWN_PCT, KILL_HEALTH_CONSECUTIVE, KILL_LOSS_RISK_MULTIPLE) to
+# see EXACTLY what can stop the system and why. Nothing in this section reads
+# or writes signal rules, sizing, or stop/target levels -- it only flips a
+# KILLED flag in memory and alerts. evaluate_kill_switch() is the single entry
+# point called once per rotation; clear_kill_switch() is the manual reset.
+# ---------------------------------------------------------------------------
+
+def is_killed():
+    """True if the kill switch is currently latched (reads memory only)."""
+    return bool(load_memory().get("kill_switch", {}).get("killed"))
+
+def _kill_switch_anomalies(mem):
+    """Trigger 3: return a list of 'impossible' states. Each of these should be
+    unreachable in normal operation, so any hit means something is broken --
+    NOT that we are merely losing."""
+    out = []
+    positions = mem.get("paper_positions", [])
+
+    # (a) Inverted stop/target on an OPEN position. A SELL must have stop above
+    #     and target below entry; a BUY the reverse. Anything else is corrupt.
+    for p in positions:
+        d, e, s, t = p.get("direction"), p.get("entry"), p.get("stop"), p.get("target")
+        if None in (e, s, t):
+            continue
+        if d == "SELL" and not (s > e and t < e):
+            out.append(f"inverted SELL stop/target on {p.get('pair')} "
+                       f"(entry {e}, stop {s}, target {t})")
+        if d == "BUY" and not (s < e and t > e):
+            out.append(f"inverted BUY stop/target on {p.get('pair')} "
+                       f"(entry {e}, stop {s}, target {t})")
+
+    # (b) Validated open positions exceeding the concurrent cap. The guard in
+    #     can_open_position() should make this impossible.
+    validated_open = sum(1 for p in positions if not p.get("watch"))
+    if validated_open > MAX_CONCURRENT_POSITIONS:
+        out.append(f"{validated_open} validated open positions exceed cap "
+                   f"{MAX_CONCURRENT_POSITIONS}")
+
+    # (c) A closed trade whose realised loss exceeds what its OWN risk model
+    #     allowed. The simulator exits exactly at the stop, so a real loss is
+    #     bounded by risk_usdt; a loss well beyond it means the stop logic
+    #     failed. The multiple gives wide headroom so variance never trips it.
+    for tr in mem.get("paper_closed", []):
+        pnl = tr.get("pnl_usdt", 0.0)
+        risk = tr.get("risk_usdt")
+        if pnl < 0 and risk and risk > 0 and abs(pnl) > risk * KILL_LOSS_RISK_MULTIPLE:
+            out.append(f"{tr.get('pair')} closed loss ${pnl:.2f} exceeds "
+                       f"{KILL_LOSS_RISK_MULTIPLE}x its risk model (${risk:.2f})")
+            break  # one is enough to trip
+
+    return out
+
+def trip_kill_switch(mem, reasons):
+    """Latch the KILLED flag, print a loud banner, and alert. Never auto-clears."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    mem["kill_switch"] = {"killed": True, "reasons": reasons, "time": ts}
+    save_memory(mem)
+    bar = "!" * 64
+    print("\n" + bar)
+    print("!!! KILL SWITCH TRIPPED -- NEW TRADES HALTED !!!")
+    print(f"!!! Time: {ts}")
+    for r in reasons:
+        print(f"!!!  - {r}")
+    print("!!! Existing open positions are still tracked to completion.")
+    print("!!! The system will NOT auto-resume. To restart deliberately, run:")
+    print('!!!   python -c "import day_trade_team_final as t; t.clear_kill_switch()"')
+    print(bar + "\n")
+    if TELEGRAM_ENABLED:
+        telegram_send(
+            "\U0001f6d1 KILL SWITCH TRIPPED -- new trades halted.\n"
+            + "\n".join(f"- {r}" for r in reasons)
+            + "\nExisting positions still tracked. Manual restart required."
+        )
+
+def evaluate_kill_switch():
+    """Single per-rotation entry point. Returns True if NEW trades must be
+    blocked this rotation. If already killed, stays killed (no re-evaluation,
+    no auto-resume). Otherwise checks the three triggers and latches on the
+    first hit. Notify-only / gate-only: never touches signal or sizing logic."""
+    if not KILL_SWITCH_ENABLED:
+        return False
+    mem = load_memory()
+    if mem.get("kill_switch", {}).get("killed"):
+        return True  # latched -- requires a manual clear_kill_switch()
+
+    reasons = []
+
+    # 1. HARD EQUITY FLOOR (a capital emergency, NOT ordinary losing variance).
+    dd = mem.get("risk_state", {}).get("drawdown_pct", 0.0)
+    if dd > KILL_HARD_DRAWDOWN_PCT:
+        reasons.append(f"HARD EQUITY FLOOR: validated drawdown {dd}% "
+                       f"> {KILL_HARD_DRAWDOWN_PCT}%")
+
+    # 2. REPEATED HEALTH FAILURES (a persistent broken state across rotations).
+    consec = mem.get("health", {}).get("consecutive_failures", 0)
+    if consec >= KILL_HEALTH_CONSECUTIVE:
+        reasons.append(f"REPEATED HEALTH FAILURES: {consec} consecutive rotations "
+                       f">= {KILL_HEALTH_CONSECUTIVE}")
+
+    # 3. ANOMALY: an impossible/corrupt state.
+    for a in _kill_switch_anomalies(mem):
+        reasons.append(f"ANOMALY: {a}")
+
+    if reasons:
+        trip_kill_switch(mem, reasons)
+        return True
+    return False
+
+def clear_kill_switch():
+    """MANUAL reset. The system never auto-resumes -- you must call this
+    deliberately (e.g. python -c "import day_trade_team_final as t;
+    t.clear_kill_switch()") after investigating what tripped it."""
+    mem = load_memory()
+    mem["kill_switch"] = {
+        "killed": False, "reasons": [],
+        "cleared_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+    save_memory(mem)
+    print("Kill switch CLEARED. New trades may resume on the next rotation.")
+    if TELEGRAM_ENABLED:
+        telegram_send("✅ Kill switch cleared manually. New trades re-enabled.")
 
 def save_trade(pair, signal, sentiment, decision, price, stop=None, target=None,
                direction=None, market_type=None, regime=None, watch=False):
@@ -1541,6 +1895,7 @@ def update_risk_state():
     rs = mem.setdefault("risk_state", {"peak_equity": ACCOUNT_SIZE, "equity": ACCOUNT_SIZE,
                                        "drawdown_pct": 0.0, "paused": False,
                                        "reduce_risk": False, "mode": "NORMAL"})
+    old_mode = rs.get("mode", "NORMAL")  # for transition-only notification
     equity = paper_equity(mem)
     peak = max(rs.get("peak_equity", ACCOUNT_SIZE), equity)
     dd = round((peak - equity) / peak * 100, 2) if peak > 0 else 0.0
@@ -1557,6 +1912,9 @@ def update_risk_state():
                "paused": paused, "reduce_risk": reduce_risk, "mode": mode})
     mem["risk_state"] = rs
     save_memory(mem)
+    # Notify-only: fire ONLY on an actual mode transition (never per rotation).
+    if mode != old_mode:
+        notify_drawdown_transition(old_mode, mode, rs)
     return rs
 
 def current_risk_percent():
@@ -1622,6 +1980,7 @@ def open_paper_position(pair, market_type, direction, entry, stop, target, regim
     label = "OPEN[WATCH]" if watch else "OPEN"
     print(f"Paper   : {label} {direction} {pair} qty {qty} @ {entry} "
           f"(stop {stop} / target {target}) | risk ${actual_risk:.2f} ({rp}%)")
+    notify_trade_opened(pos)  # notify-only
     return pos
 
 def update_paper_positions():
@@ -1674,6 +2033,9 @@ def update_paper_positions():
                 wps["total_pnl"] = round(wps.get("total_pnl", 0.0) + pnl, 2)
                 print(f"Paper   : CLOSE[WATCH] {direction} {p['pair']} -> {outcome} "
                       f"@ {exitp} | PnL ${pnl:+.2f}")
+                w_closed = wps.get("wins", 0) + wps.get("losses", 0)
+                w_wr = round(wps.get("wins", 0) / w_closed * 100, 1) if w_closed else 0.0
+                notify_trade_closed(closed, w_wr, w_closed)  # notify-only
             else:
                 if outcome == "WIN":
                     ps["wins"] = ps.get("wins", 0) + 1
@@ -1686,6 +2048,9 @@ def update_paper_positions():
                 _bump_breakdown(mem, "by_pair", p.get("pair"), outcome, pnl)
                 print(f"Paper   : CLOSE {direction} {p['pair']} -> {outcome} "
                       f"@ {exitp} | PnL ${pnl:+.2f}")
+                v_closed = ps.get("wins", 0) + ps.get("losses", 0)
+                v_wr = round(ps.get("wins", 0) / v_closed * 100, 1) if v_closed else 0.0
+                notify_trade_closed(closed, v_wr, v_closed)  # notify-only
         else:
             unreal = (entry - price) * qty if direction == "SELL" else (price - entry) * qty
             p["current_price"] = round(price, 6)
@@ -1871,12 +2236,27 @@ def run_health_check(rotation_count):
         fails.append(f"RUNTIME: {e}")
 
     status = "OK" if not fails else "WARNING"
+
+    # Consecutive-failure counter (read OLD value before overwriting health).
+    # Used by the kill-switch's "repeated health failures" trigger. This is
+    # measurement only -- it does not change any check result.
+    prev_consecutive = mem.get("health", {}).get("consecutive_failures", 0)
+    consecutive_failures = (prev_consecutive + 1) if fails else 0
+
+    # Notify-only dedup: only alert when the failure set CHANGES, so the same
+    # warning is not resent every rotation. Reset on OK so a recurrence re-alerts.
+    sig = "|".join(sorted(fails)) if fails else ""
+    nf = mem.setdefault("notify", {})
+    should_notify_health = bool(fails) and sig != nf.get("last_health_sig", "")
+    nf["last_health_sig"] = sig
+
     mem["health"] = {
         "status": status,
         "last_check": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "rotation": rotation_count,
         "checks_run": 7,
         "failures": fails,
+        "consecutive_failures": consecutive_failures,
     }
     save_memory(mem)
     _freshness_prev = dict(_freshness)  # snapshot for next rotation's advancement check
@@ -1886,6 +2266,8 @@ def run_health_check(rotation_count):
         for f in fails:
             print(f"  - {f}")
         print("*** END HEALTH WARNING ***\n")
+        if should_notify_health:
+            notify_health(fails)  # notify-only (deduplicated)
     else:
         print(f"Health  : OK ({mem['health']['checks_run']} checks passed)")
     return mem["health"]
@@ -2091,57 +2473,11 @@ def llm_savings_line():
     return (f"LLM   : Analyst(Haiku) {haiku} | Risk(Sonnet) {sonnet_risk} | "
             f"pre-filter skips {skips} | ~{saved} Analyst calls saved vs old design (cum.)")
 
-def run_one_rotation(rotation_count):
-    """One full scan cycle. Wrapped by the caller in try/except (change C) so a
-    transient API/network error in any single pair or rotation logs and
-    continues, rather than crashing the whole loop. Returns the (possibly
-    incremented) rotation_count."""
-    global _validated_opens_this_rotation
-    # Reset the per-rotation opened-positions counter (used by the health check).
-    _validated_opens_this_rotation = 0
-
-    # Update the paper portfolio against real live prices (close any hits).
-    update_paper_positions()
-
-    # --- V3: recompute drawdown / risk mode against fresh equity ---
-    rs = update_risk_state()
-    risk_mode = rs["mode"]
-
-    # --- Detect 4-state market regime at the start of each rotation ---
-    regime4, btc_price, btc_ema, btc_slope = get_btc_regime()
-    regime2 = "BULL" if regime4 in BULL_STATES else "BEAR"
-    sell_action = ("SELL SKIPPED (negative edge)"
-                   if REGIME_SELL_RISK_PCT.get(regime4) is None else "SELL enabled")
-    if btc_price is not None:
-        sl = "rising" if (btc_slope or 0) > 0 else "falling" if (btc_slope or 0) < 0 else "flat"
-        print(f"REGIME: {regime4}  (BTC {btc_price} vs 50-4h-EMA {btc_ema}, "
-              f"slope {btc_slope} {sl})")
-        print(f"        -> base {regime2}: "
-              f"{'BUY + SELL' if regime2 == 'BULL' else 'SELL only'}; {sell_action}")
-    else:
-        print(f"REGIME: {regime4} (BTC data unavailable -- conservative default)")
-
-    # --- V3: rich rotation status line + drawdown report ---
-    open_n = len(load_memory().get("paper_positions", []))
-    a, w, r = today_signal_counts()
-    risk_label = {"NORMAL": "NORMAL (1%)", "REDUCED": "REDUCED (0.5%)",
-                  "PAUSED": "PAUSED (no new entries)"}[risk_mode]
-    print(f"STATUS | Regime: {regime4} | Risk: {risk_label} | "
-          f"Equity: ${rs['equity']:.2f} | Drawdown: {rs['drawdown_pct']}% | "
-          f"Open: {open_n} | Today: {a} approved / {w} wait / {r} rejected")
-    print(f"Equity: ${rs['equity']:.2f} | Peak: ${rs['peak_equity']:.2f} | "
-          f"Drawdown: {rs['drawdown_pct']}% (reduce>{DD_REDUCE_PCT}% / "
-          f"pause>{DD_PAUSE_PCT}% / resume<{DD_RESUME_PCT}%)")
-
-    print(f"Stats: {get_stats()}")
-    print(llm_savings_line())
-    print_paper_portfolio()
-    write_dashboard_state(regime4)  # persist snapshot for the HTML dashboard
-    now = datetime.now(pytz.timezone("Europe/London"))
-    print(f"Time: {now.strftime('%H:%M')} UK\n")
-
-    # Each scan_market is individually wrapped so one bad pair never aborts the
-    # rest of the rotation (change C).
+def _run_all_scans(regime4, risk_mode):
+    """Run every per-pair scan_market for this rotation. Extracted so the
+    kill-switch can gate ALL new-trade scanning with a single, readable guard.
+    Each scan_market is individually wrapped so one bad pair never aborts the
+    rest of the rotation (change C)."""
     print("=== CRYPTO (24/7) ===")
     for pair in CRYPTO_PAIRS:
         try:
@@ -2199,6 +2535,69 @@ def run_one_rotation(rotation_count):
         else:
             print("=== FOREX (Weekend Closed) ===\n")
 
+def run_one_rotation(rotation_count):
+    """One full scan cycle. Wrapped by the caller in try/except (change C) so a
+    transient API/network error in any single pair or rotation logs and
+    continues, rather than crashing the whole loop. Returns the (possibly
+    incremented) rotation_count."""
+    global _validated_opens_this_rotation
+    # Reset the per-rotation opened-positions counter (used by the health check).
+    _validated_opens_this_rotation = 0
+
+    # Update the paper portfolio against real live prices (close any hits).
+    update_paper_positions()
+
+    # --- V3: recompute drawdown / risk mode against fresh equity ---
+    rs = update_risk_state()
+    risk_mode = rs["mode"]
+
+    # --- KILL SWITCH: evaluate the circuit breaker against fresh state. If it
+    # trips (or was already tripped), NO new trades are scanned/opened this
+    # rotation; existing open positions were already marked-to-market above and
+    # continue to be tracked to completion. Requires a manual restart. ---
+    killed = evaluate_kill_switch()
+
+    # --- Detect 4-state market regime at the start of each rotation ---
+    regime4, btc_price, btc_ema, btc_slope = get_btc_regime()
+    regime2 = "BULL" if regime4 in BULL_STATES else "BEAR"
+    sell_action = ("SELL SKIPPED (negative edge)"
+                   if REGIME_SELL_RISK_PCT.get(regime4) is None else "SELL enabled")
+    if btc_price is not None:
+        sl = "rising" if (btc_slope or 0) > 0 else "falling" if (btc_slope or 0) < 0 else "flat"
+        print(f"REGIME: {regime4}  (BTC {btc_price} vs 50-4h-EMA {btc_ema}, "
+              f"slope {btc_slope} {sl})")
+        print(f"        -> base {regime2}: "
+              f"{'BUY + SELL' if regime2 == 'BULL' else 'SELL only'}; {sell_action}")
+    else:
+        print(f"REGIME: {regime4} (BTC data unavailable -- conservative default)")
+
+    # --- V3: rich rotation status line + drawdown report ---
+    open_n = len(load_memory().get("paper_positions", []))
+    a, w, r = today_signal_counts()
+    risk_label = {"NORMAL": "NORMAL (1%)", "REDUCED": "REDUCED (0.5%)",
+                  "PAUSED": "PAUSED (no new entries)"}[risk_mode]
+    print(f"STATUS | Regime: {regime4} | Risk: {risk_label} | "
+          f"Equity: ${rs['equity']:.2f} | Drawdown: {rs['drawdown_pct']}% | "
+          f"Open: {open_n} | Today: {a} approved / {w} wait / {r} rejected")
+    print(f"Equity: ${rs['equity']:.2f} | Peak: ${rs['peak_equity']:.2f} | "
+          f"Drawdown: {rs['drawdown_pct']}% (reduce>{DD_REDUCE_PCT}% / "
+          f"pause>{DD_PAUSE_PCT}% / resume<{DD_RESUME_PCT}%)")
+
+    print(f"Stats: {get_stats()}")
+    print(llm_savings_line())
+    print_paper_portfolio()
+    write_dashboard_state(regime4)  # persist snapshot for the HTML dashboard
+    now = datetime.now(pytz.timezone("Europe/London"))
+    print(f"Time: {now.strftime('%H:%M')} UK\n")
+
+    # Open NEW trades only when the kill switch has NOT tripped. Existing
+    # positions are tracked regardless (update_paper_positions above).
+    if killed:
+        print("KILL SWITCH ACTIVE -- skipping all scans; no new trades will be "
+              "opened. Existing positions still tracked. Manual restart required.\n")
+    else:
+        _run_all_scans(regime4, risk_mode)
+
     rotation_count += 1
     print(f"--- Rotation {rotation_count} complete ---")
 
@@ -2206,9 +2605,13 @@ def run_one_rotation(rotation_count):
     # It also flushes this rotation's runtime errors into the health section.
     run_health_check(rotation_count)
 
-    if rotation_count % 10 == 0:
+    # Skip the (LLM) reflection agent while killed -- the desk is halted.
+    if rotation_count % 10 == 0 and not killed:
         print("Running reflection agent...")
         reflection_agent()
+
+    # Notify-only: weekly template digest (sends at most once / 7 days).
+    maybe_send_weekly_digest()
 
     return rotation_count
 
@@ -2226,6 +2629,15 @@ def run_trading_team():
     print(f"EXECUTION: {('LIVE on ' + EXEC_VENUE + ' testnet') if EXECUTE_TRADES else 'OFF (signal-only)'}"
           f" | Longs {'ON' if ALLOW_LONGS else 'OFF'}")
     print("PAPER TRADER: ON -- internal simulator, real live prices, no broker")
+    print(f"TELEGRAM: {'ON' if TELEGRAM_ENABLED else 'OFF (token/chat id not set)'}"
+          f" | trades {NOTIFY_TRADES} drawdown {NOTIFY_DRAWDOWN} "
+          f"health {NOTIFY_HEALTH} digest {NOTIFY_DIGEST}")
+    print(f"KILL SWITCH: {'ON' if KILL_SWITCH_ENABLED else 'OFF'} "
+          f"(floor {KILL_HARD_DRAWDOWN_PCT}% dd / {KILL_HEALTH_CONSECUTIVE} "
+          f"health fails / {KILL_LOSS_RISK_MULTIPLE}x-risk anomaly)")
+    if KILL_SWITCH_ENABLED and is_killed():
+        print("!!! KILL SWITCH IS LATCHED from a previous run -- NO new trades "
+              "will open until clear_kill_switch() is called. !!!")
 
     # --- Execution readiness gate: only relevant when EXECUTE_TRADES is on ---
     if EXECUTE_TRADES:
