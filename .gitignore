@@ -1,0 +1,7 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+
+# Secrets and runtime state (never commit)
+.env
+agent_memory.json
